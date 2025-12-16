@@ -1,4 +1,4 @@
-RetroMCTS: AI-Driven Retrosynthesis Planner
+#RetroMCTS: AI-Driven Retrosynthesis Planner
 
 RetroMCTS is a Python-based Artificial Intelligence agent designed to solve the retrosynthetic planning problem. Using Monte Carlo Tree Search (MCTS) and chemical rules encoded in SMARTS, the agent recursively decomposes complex target molecules (like drugs) into commercially available building blocks.
 
@@ -40,7 +40,7 @@ RDKit
 
 Installation
 
-# Install RDKit via pip
+Install RDKit via pip
 pip install rdkit
 
 
