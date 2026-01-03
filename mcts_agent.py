@@ -1,230 +1,402 @@
 import math
 import random
 import sys
+import time
+from functools import lru_cache
+from collections import Counter
 
-# RDKit kütüphanesi kontrolü
+# RDKit
 try:
     from rdkit import Chem
     from rdkit.Chem import AllChem
+    from rdkit import RDLogger
 except ImportError:
-    print("HATA: RDKit kütüphanesi bulunamadı. Lütfen 'pip install rdkit' ile kurun.")
+    print("ERROR: RDKit library not found.")
     sys.exit(1)
 
-# --- 1. BİLGİ BANKASI (KNOWLEDGE BASE) ---
+# PubChemPy
+try:
+    import pubchempy as pcp
 
-REACTION_TEMPLATES = [
-    # Kural 1: Ester Hidrolizi (Ester -> Asit + Alkol)
-    {'name': 'Ester Hydrolysis', 'smarts': '[C:1](=[O:2])-[O:3]-[#6:4]>>[C:1](=[O:2])O.[#6:4][O:3]'},
-    # Kural 2: Amide Hidrolizi (Amide -> Asit + Amin) (İlerisi için örnek)
-    {'name': 'Amide Hydrolysis', 'smarts': '[C:1](=[O:2])-[N:3]-[#6:4]>>[C:1](=[O:2])O.[#6:4][N:3]'}
-]
+    PUBCHEM_AVAILABLE = True
+except ImportError:
+    PUBCHEM_AVAILABLE = False
 
-# Hedef (Satın Alınabilir) Moleküller
-# Bu listeyi program başladığında normalize edeceğiz.
-RAW_BUYABLES = {
-    "CC(=O)O",  # Asetik Asit
-    "O",  # Su
-    "N",  # Amonyak
-    "c1ccccc1",  # Benzen
-    "CO",  # Metanol
-    "CCO",  # Etanol
-    "Oc1ccccc1C(=O)O"  # Salisilik Asit
-}
+# Suppress RDKit warnings
+RDLogger.DisableLog('rdApp.*')
 
 
-# --- 2. YARDIMCI FONKSİYONLAR ---
-
-def canonicalize(smiles):
-    """Bir SMILES kodunu RDKit standart formatına çevirir."""
-    mol = Chem.MolFromSmiles(smiles)
-    if mol:
-        return Chem.MolToSmiles(mol, isomericSmiles=True)
-    return None
-
-
-# Satın alınabilir listesini normalize et (Hataları önlemek için)
-BUYABLE_CHEMICALS = set()
-for s in RAW_BUYABLES:
-    norm = canonicalize(s)
-    if norm: BUYABLE_CHEMICALS.add(norm)
+# --- COLOR CLASS (For Terminal) ---
+class Colors:
+    HEADER = '\033[95m'
+    BLUE = '\033[94m'
+    CYAN = '\033[96m'
+    GREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
 
 
-def is_buyable(smiles):
-    """Molekül hedef listede var mı?"""
-    norm = canonicalize(smiles)
-    return norm in BUYABLE_CHEMICALS
+# ==============================================================================
+# SECTION 1: CHEMISTRY ENGINE
+# ==============================================================================
 
+class ChemistryEngine:
+    def __init__(self):
+        # Retrosynthetic Rules
+        self.rules = [
+            {'name': 'Ester Cleavage', 'smarts': '[C:1](=[O:2])-[O:3]-[#6:4]>>[C:1](=[O:2])O.[#6:4][O:3]'},
+            {'name': 'Amide Cleavage', 'smarts': '[C:1](=[O:2])-[N:3]-[#6:4]>>[C:1](=[O:2])O.[#6:4][N:3]'},
+            {'name': 'Ether Cleavage', 'smarts': '[#6:1]-[O:2]-[#6:3]>>[#6:1][OH:2].[#6:3]O'},
+            {'name': 'Imine Cleavage', 'smarts': '[C:1]=[N:2]>>[C:1]=O.[N:2]'},
+            {'name': 'Alkene Cleavage', 'smarts': '[C:1]=[C:2]>>[C:1]=O.[C:2]=O'},
+            {'name': 'Nitro Reduction (Retro)', 'smarts': '[c:1][NH2]>>[c:1][N+](=O)[O-]'},
+            {'name': 'Sulfonamide Cleavage', 'smarts': '[S:1](=[O:2])(=[O:3])-[N:4]>>[S:1](=[O:2])(=[O:3])O.[N:4]'}
+        ]
 
-# --- 3. MCTS SINIFLARI ---
+        self.breakable_patterns = [
+            Chem.MolFromSmarts('[C](=[O])-[O]-[#6]'),  # Ester
+            Chem.MolFromSmarts('[C](=[O])-[N]-[#6]'),  # Amide
+            Chem.MolFromSmarts('[#6]-[O]-[#6]'),  # Ether
+            Chem.MolFromSmarts('[C]=[N]'),  # Imine
+            Chem.MolFromSmarts('[C]=[C]'),  # Alkene
+            Chem.MolFromSmarts('[S](=[O])(=[O])-[N]'),  # Sulfonamide
+            Chem.MolFromSmarts('[c][NH2]')  # Aromatic Amine
+        ]
 
-class MCTSNode:
-    def __init__(self, smiles, parent=None, rule_used=None):
-        self.smiles = smiles
-        self.parent = parent
-        self.rule_used = rule_used
-
-        self.children = []
-        self.visits = 0
-        self.value = 0.0  # Toplam ödül
-
-        # Durum kontrolü
-        self.is_solved = is_buyable(smiles)
-        self.is_terminal = self.is_solved  # Eğer çözüldüyse orası bir uçtur
-
-    def ucb_score(self, exploration_weight=1.41):
-        """
-        Upper Confidence Bound (UCB1) formülü.
-        Hem sömürü (exploitation) hem keşif (exploration) dengesini kurar.
-        """
-        if self.visits == 0:
-            return float('inf')  # Hiç ziyaret edilmediyse hemen seç!
-
-        # Ebeveynin ziyaret sayısı (logaritma içinde kullanılır)
-        parent_visits = self.parent.visits if self.parent else 1
-
-        exploitation = self.value / self.visits
-        exploration = exploration_weight * math.sqrt(math.log(parent_visits) / self.visits)
-
-        return exploitation + exploration
-
-    def expand(self):
-        """Olası tüm reaksiyonları uygular ve çocuk düğümleri yaratır."""
-        mol = Chem.MolFromSmiles(self.smiles)
-        if not mol: return
-
-        # Zaten genişletilmişse tekrar yapma
-        if self.children: return
-
-        for action in REACTION_TEMPLATES:
+        self.reactions = []
+        for r in self.rules:
             try:
-                rxn = AllChem.ReactionFromSmarts(action['smarts'])
-                products_list = rxn.RunReactants((mol,))
+                rxn = AllChem.ReactionFromSmarts(r['smarts'])
+                self.reactions.append((r['name'], rxn))
+            except:
+                pass
 
-                for products in products_list:
-                    # Basitleştirme: En büyük parçayı alıyoruz (Ana iskelet)
-                    largest_frag = max(products, key=lambda m: m.GetNumAtoms())
+    def get_atom_count(self, smiles):
+        mol = Chem.MolFromSmiles(smiles)
+        if not mol: return 9999
+        return mol.GetNumAtoms()
 
-                    try:
-                        Chem.SanitizeMol(largest_frag)
-                        child_smiles = Chem.MolToSmiles(largest_frag, isomericSmiles=True)
+    def is_simple_building_block(self, smiles):
+        mol = Chem.MolFromSmiles(smiles)
+        if not mol: return False
 
-                        # Döngüye girmeyi engelle (Anne = Çocuk durumu)
-                        if child_smiles == self.smiles: continue
+        atom_count = mol.GetNumAtoms()
+        ring_count = mol.GetRingInfo().NumRings()
 
-                        child = MCTSNode(smiles=child_smiles, parent=self, rule_used=action['name'])
-                        self.children.append(child)
-                    except:
-                        continue
+        # 1. MICRO MOLECULES
+        if atom_count <= 6: return True
+
+        # 2. BREAKABLE BOND CHECK
+        has_breakable_bond = False
+        for pattern in self.breakable_patterns:
+            if mol.HasSubstructMatch(pattern):
+                has_breakable_bond = True
+                break
+        if has_breakable_bond: return False
+
+        # 3. GENERAL PHYSICAL LIMITS
+        if ring_count == 1 and atom_count <= 15: return True
+        if ring_count == 0 and atom_count <= 15: return True
+        if ring_count == 2 and atom_count <= 11: return True
+
+        return False
+
+    def get_valid_moves(self, smiles):
+        mol = Chem.MolFromSmiles(smiles)
+        if not mol: return []
+        possible_moves = []
+
+        for name, rxn in self.reactions:
+            try:
+                outcomes = rxn.RunReactants((mol,))
+                for outcome in outcomes:
+                    fragments = []
+                    valid_outcome = True
+                    for frag in outcome:
+                        try:
+                            Chem.SanitizeMol(frag)
+                            smi = Chem.MolToSmiles(frag, isomericSmiles=True)
+                            fragments.append(smi)
+                        except:
+                            valid_outcome = False; break
+
+                    if not valid_outcome or not fragments: continue
+
+                    fragments.sort(key=lambda x: self.get_atom_count(x), reverse=True)
+                    main_product = fragments[0]
+                    side_products = fragments[1:]
+
+                    if all(self.is_simple_building_block(sp) for sp in side_products):
+                        if main_product != smiles:
+                            possible_moves.append({
+                                'rule': name,
+                                'main': main_product,
+                                'sides': side_products
+                            })
             except:
                 continue
+        return possible_moves
 
 
-class MCTSEngine:
-    def __init__(self, root_smiles):
-        self.root = MCTSNode(root_smiles)
+# ==============================================================================
+# SECTION 2: MCTS BRAIN
+# ==============================================================================
 
-    def select(self, node):
-        """
-        Ağaçta aşağı inerek en iyi (UCB) düğümü seçer.
-        Strateji:
-        1. Eğer düğümün çocukları yoksa ve genişletilebilir ise -> O düğümü döndür.
-        2. Eğer çocukları varsa -> En yüksek UCB puanlı çocuğa git ve tekrar et.
-        """
-        current = node
-        while True:
-            # Eğer bu düğüm daha önce hiç genişletilmediyse (ve çözülmediyse), onu seç
-            if not current.children and not current.is_terminal:
-                # Ancak belki henüz expand edilmemiştir, expand edilebilir mi diye bakmıyoruz
-                # MCTS'de genelde: Leaf node'a gel -> Expand et -> Bir çocuğa git.
-                return current
+class Node:
+    def __init__(self, state, parent=None, action_used=None, side_products=None):
+        self.state = state
+        self.parent = parent
+        self.action_used = action_used
+        self.side_products = side_products if side_products else []
+        self.children = []
+        self.visits = 0
+        self.score = 0.0
+        self.untried_moves = None
 
-            # Eğer terminal ise (çözüldü veya çıkmaz sokak)
-            if current.is_terminal or not current.children:
-                return current
+    def ucb1(self, c=1.41):
+        if self.visits == 0: return float('inf')
+        return (self.score / self.visits) + c * math.sqrt(math.log(self.parent.visits) / self.visits)
 
-            # Çocuklardan en yüksek UCB puanına sahip olanı seç
-            current = max(current.children, key=lambda c: c.ucb_score())
 
-    def simulate(self, node):
-        """
-        Rollout: Düğümün ne kadar 'iyi' olduğunu tahmin et.
-        Basit bir ödül fonksiyonu:
-        - Eğer satın alınabilir ise: +100 puan
-        - Değilse: -1 puan (Maliyet)
-        """
-        if node.is_solved:
-            return 100.0
-        else:
-            # Basit sezgisel: Molekül ne kadar küçükse o kadar iyidir (Basitliğe yaklaşmışızdır)
-            # Bu, ajanı molekülü küçültmeye teşvik eder.
-            mol = Chem.MolFromSmiles(node.smiles)
-            atom_count = mol.GetNumAtoms() if mol else 100
-            return 10.0 / atom_count  # Deneysel bir ödül
+class MCTSSolver:
+    def __init__(self, root_smiles, chemistry_engine):
+        self.root = Node(root_smiles)
+        self.chem = chemistry_engine
 
-    def backpropagate(self, node, reward):
-        """Sonucu yukarı taşı."""
-        current = node
-        while current:
-            current.visits += 1
-            current.value += reward
-            current = current.parent
-
-    def run(self, iterations=10):
-        print(f"--- MCTS Başlıyor ({iterations} iterasyon) ---")
+    def solve(self, iterations=200):
+        # Progress Bar
+        print(f"   {Colors.CYAN}Analyzing:{Colors.ENDC} ", end="")
+        bar_length = 30
 
         for i in range(iterations):
-            # 1. Selection
-            selected_node = self.select(self.root)
+            if i % (iterations // bar_length) == 0:
+                progress = (i + 1) / iterations
+                filled = int(bar_length * progress)
+                bar = '█' * filled + '░' * (bar_length - filled)
+                sys.stdout.write(f"\r   {Colors.CYAN}Progress:{Colors.ENDC} [{bar}] %{int(progress * 100)}")
+                sys.stdout.flush()
 
-            # 2. Expansion (Eğer seçilen düğüm daha önce ziyaret edildiyse ve terminal değilse genişlet)
-            # Not: Standart MCTS'de genelde ilk ziyarette expand edilir.
-            if selected_node.visits > 0 and not selected_node.is_terminal:
-                selected_node.expand()
-                # Genişledikten sonra çocuklardan birini seçmemiz lazım (veya ilkini)
-                if selected_node.children:
-                    selected_node = selected_node.children[0]  # Basitlik için ilk çocuğa geç
+            leaf = self.select(self.root)
+            child = self.expand(leaf)
+            simulation_score = self.simulate(child)
+            self.backpropagate(child, simulation_score)
 
-            # 3. Simulation
-            reward = self.simulate(selected_node)
+        sys.stdout.write(f"\r   {Colors.CYAN}Progress:{Colors.ENDC} [{'█' * bar_length}] %100     \n")
+        print(f"   {Colors.GREEN}✓ Computation Complete.{Colors.ENDC}\n")
 
-            # 4. Backpropagation
-            self.backpropagate(selected_node, reward)
+    def select(self, node):
+        while node.children:
+            node = max(node.children, key=lambda n: n.ucb1())
+        return node
 
-            # Log (İsteğe bağlı)
-            # print(f"Iter {i+1}: Node={selected_node.smiles[:10]}... Reward={reward:.2f}")
+    def expand(self, node):
+        if node.untried_moves is None:
+            if self.chem.is_simple_building_block(node.state):
+                node.untried_moves = []
+            else:
+                node.untried_moves = self.chem.get_valid_moves(node.state)
 
-        print("--- Arama Tamamlandı ---")
+        if not node.untried_moves: return node
 
-    def print_best_path(self):
-        """En çok ziyaret edilen yolu yazdırır."""
+        move = node.untried_moves.pop()
+        child_node = Node(
+            state=move['main'],
+            parent=node,
+            action_used=move['rule'],
+            side_products=move['sides']
+        )
+        node.children.append(child_node)
+        return child_node
+
+    def simulate(self, node):
+        atom_count = self.chem.get_atom_count(node.state)
+        if self.chem.is_simple_building_block(node.state): return 100.0
+        return 20.0 / atom_count
+
+    def backpropagate(self, node, score):
+        while node:
+            node.visits += 1
+            node.score += score
+            node = node.parent
+
+    def get_best_trace(self):
+        trace = []
         current = self.root
-        print("\n=== ÖNERİLEN SENTEZ YOLU ===")
-        print(f"Hedef: {current.smiles}")
-
-        while current.children:
-            # En iyi hamle genelde 'en çok ziyaret edilen' (robust) olandır, en yüksek puanlı değil.
-            best_child = max(current.children, key=lambda c: c.visits)
-            print(f"  |\n  v ({best_child.rule_used})")
-            print(f"Ara Ürün: {best_child.smiles} (Ziyaret: {best_child.visits}, Çözüldü: {best_child.is_solved})")
-
-            if best_child.is_solved:
-                print("\nSONUÇ: Başarılı! Bu molekül satın alınabilir listesinde.")
-                return
-            current = best_child
-
-        print("\nSONUÇ: Tam yol bulunamadı veya daha fazla iterasyon gerekli.")
+        while True:
+            step_info = {
+                'smiles': current.state,
+                'action': current.action_used,
+                'sides': current.side_products,
+                'is_solved': self.chem.is_simple_building_block(current.state)
+            }
+            trace.append(step_info)
+            if not current.children: break
+            current = max(current.children, key=lambda c: c.visits)
+        return trace
 
 
-# --- 4. TEST ---
+# ==============================================================================
+# SECTION 3: INTERFACE
+# ==============================================================================
+
+@lru_cache(maxsize=1024)
+def get_pubchem_name(smiles):
+    if not PUBCHEM_AVAILABLE: return smiles
+    try:
+        compounds = pcp.get_compounds(smiles, namespace='smiles')
+        if compounds and compounds[0].iupac_name:
+            return f"{compounds[0].iupac_name}"
+        if compounds and compounds[0].synonyms:
+            return f"{compounds[0].synonyms[0]}"
+    except:
+        pass
+    return smiles
+
+
+def print_banner():
+    banner = f"""
+    {Colors.BOLD}{Colors.CYAN}
+    ######################################################
+    #                                                    #
+    #      R E T R O - M C T S   A I   A G E N T         #
+    #                                                    #
+    #      AI-Powered Retrosynthesis Tool                #
+    #      v2.0                                          #
+    #                                                    #
+    ######################################################
+    {Colors.ENDC}
+    """
+    print(banner)
+
+
+def print_instructions():
+    print(f"""
+    {Colors.BOLD}{Colors.UNDERLINE}HOW IT WORKS?{Colors.ENDC}
+    This agent uses Monte Carlo Tree Search (MCTS) to break down the 
+    target molecule into simple components. The search consists of 4 stages:
+
+    1. {Colors.BOLD}Selection:{Colors.ENDC} The most promising reaction path is chosen via UCB1.
+    2. {Colors.BOLD}Expansion:{Colors.ENDC} Molecule is fragmented using 7 known chemical rules.
+    3. {Colors.BOLD}Simulation:{Colors.ENDC} Fragment complexity is scored based on atom count.
+    4. {Colors.BOLD}Backpropagation:{Colors.ENDC} The score is carried back up the tree.
+
+    {Colors.BOLD}{Colors.UNDERLINE}AGENT REACTION RULES (SCISSORS):{Colors.ENDC}
+    ✂️  {Colors.CYAN}Ester & Amide Cleavage:{Colors.ENDC} Breaks basic pharmaceutical bonds.
+    ✂️  {Colors.CYAN}Ether & Imine Cleavage:{Colors.ENDC} Fragments Oxygen and Nitrogen bridges.
+    ✂️  {Colors.CYAN}Alkene Cleavage:{Colors.ENDC} Oxidizes Carbon-Carbon double bonds.
+    ✂️  {Colors.CYAN}Nitro Reduction (Retro):{Colors.ENDC} Converts Amines back to Nitro groups.
+    ✂️  {Colors.CYAN}Sulfonamide Cleavage:{Colors.ENDC} Breaks down Sulfate-class drugs.
+    """)
+
+
+def main():
+    chem = ChemistryEngine()
+    print_banner()
+    print_instructions()
+
+    if not PUBCHEM_AVAILABLE:
+        print(f"{Colors.WARNING}WARNING: 'pubchempy' not found. Compound naming disabled.{Colors.ENDC}")
+
+    while True:
+        print(f"{Colors.BOLD}Ready for New Analysis.{Colors.ENDC} (Exit: 'q')")
+        smi = input(f">> Target SMILES Code: ").strip()
+
+        if smi.lower() == 'q':
+            print("\nGoodbye! 👋")
+            break
+        if not smi: continue
+
+        # Validation
+        mol_check = Chem.MolFromSmiles(smi)
+        if mol_check is None:
+            print(f"{Colors.FAIL}❌ ERROR: Invalid SMILES format!{Colors.ENDC}\n")
+            continue
+
+        try:
+            target_name = get_pubchem_name(smi)
+            print(f"\n{Colors.BOLD}Target Molecule:{Colors.ENDC} {target_name}")
+            print(f"{Colors.BOLD}Formula:{Colors.ENDC} {smi}")
+            print("-" * 50)
+
+            solver = MCTSSolver(smi, chem)
+            solver.solve(iterations=200)
+
+            trace = solver.get_best_trace()
+
+            # --- REPORTING SECTION ---
+            print(f"\n{Colors.BOLD}{Colors.UNDERLINE}SYNTHETIC ROUTE REPORT{Colors.ENDC}\n")
+
+            total_materials = []
+
+            # Root Node Check
+            if len(trace) == 1 and trace[0]['is_solved']:
+                print(f"{Colors.GREEN}ℹ️  RESULT: This molecule is already a 'Building Block'.{Colors.ENDC}")
+                print(f"   (Available in market or too simple to fragment.)\n")
+                continue
+
+            # Step-by-Step Printing
+            for i, step in enumerate(trace):
+                name = get_pubchem_name(step['smiles'])
+
+                if i == 0:
+                    # Starting point
+                    print(f"🎯 {Colors.BOLD}TARGET:{Colors.ENDC} {name}")
+                else:
+                    # Arrow and Rule
+                    rule = step['action']
+                    print(f"   │")
+                    print(f"   ▼  {Colors.WARNING}Reaction: {rule}{Colors.ENDC}")
+
+                    # Products
+                    if step['is_solved']:
+                        color = Colors.GREEN
+                        tag = "✅ [BUILDING BLOCK]"
+                    else:
+                        color = Colors.CYAN
+                        tag = "🔹 [INTERMEDIATE]"
+
+                    print(f"   │")
+                    print(f"   └── {color}{tag} {name}{Colors.ENDC}")
+
+                    # Side Products
+                    if step['sides']:
+                        for side in step['sides']:
+                            side_name = get_pubchem_name(side)
+                            print(f"      └── ➕ {Colors.GREEN}[SIDE PRODUCT] {side_name}{Colors.ENDC}")
+                            total_materials.append(side_name)
+
+                # Add final piece to materials if solved
+                if i == len(trace) - 1 and step['is_solved']:
+                    total_materials.append(name)
+
+            # Final Status
+            final_step = trace[-1]
+            print("\n" + "=" * 50)
+
+            if final_step['is_solved']:
+                print(f"{Colors.GREEN}{Colors.BOLD}✅ SYNTHESIS SUCCESSFULLY PLANNED!{Colors.ENDC}")
+                print("All components reduced to basic building blocks.")
+
+                print(f"\n{Colors.BOLD}📃 REQUIRED MATERIALS LIST (Recipe):{Colors.ENDC}")
+                counts = Counter(total_materials)
+                for mat, count in counts.items():
+                    print(f"   • {count}x {mat}")
+            elif len(trace) > 1:
+                print(f"{Colors.WARNING}{Colors.BOLD}⚠️  PARTIALLY SUCCESSFUL{Colors.ENDC}")
+                print("Molecule simplified but could not reach full building blocks.")
+                print("Current rules cannot fragment the remaining part.")
+            else:
+                print(f"{Colors.FAIL}{Colors.BOLD}❌ NO SOLUTION FOUND{Colors.ENDC}")
+                print("No suitable starting move found for this molecule.")
+
+            print("=" * 50 + "\n")
+
+        except Exception as e:
+            print(f"{Colors.FAIL}An unexpected error occurred: {e}{Colors.ENDC}\n")
+
+
 if __name__ == "__main__":
-    # Aspirin
-    target_smiles = "CC(=O)Oc1ccccc1C(=O)O"
-
-    # Motoru Başlat
-    engine = MCTSEngine(target_smiles)
-
-    # Aramayı Başlat (50 adım)
-    engine.run(iterations=50)
-
-    # Sonucu Göster
-    engine.print_best_path()
+    main()
