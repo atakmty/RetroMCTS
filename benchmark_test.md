@@ -105,7 +105,7 @@ Multistep synthesis (2-4 steps) involving nested functional groups.
 | 79 | Atenolol                     | Advanced   | `CC(C)NCC(O)COc1ccc(CC(N)=O)cc1`                            |
 | 80 | Propranolol                  | Advanced   | `CC(C)NCC(O)COc1cccc2ccccc12`                               |
 | 81 | Metoprolol                   | Advanced   | `CC(C)NCC(O)COc1ccc(CCOC)cc1`                               |
-| 82 | Verapamil (Fragment)         | Advanced   | `COc1ccc(CCN(C)CCCC(C#N)(c2ccc(OC)c(OC)c(OC)c2)C(C)C)cc1OC` |
+| 82 | Verapamil (Fragment)         | Advanced   | `COc1ccc(CCN(C)CCCC(C#N)(c2ccc(OC)c(OC)c2)C(C)C)cc1OC` |
 | 83 | Diltiazem                    | Advanced   | `CC(=O)OC1C(Sc2ccccc2N(CCN(C)C)C1=O)c3ccc(OC)cc3`           |
 | 84 | Amitriptyline                | Advanced   | `CN(C)CCC=C1c2ccccc2CCc3ccccc13`                            |
 | 85 | Fluoxetine (Prozac)          | Advanced   | `CNCCC(c1ccccc1)Oc2ccc(cc2)C(F)(F)F`                        |

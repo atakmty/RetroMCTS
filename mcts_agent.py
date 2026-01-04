@@ -49,7 +49,7 @@ class ChemistryEngine:
         self.rules = [
             {'name': 'Ester Cleavage', 'smarts': '[C:1](=[O:2])-[O:3]-[#6:4]>>[C:1](=[O:2])O.[#6:4][O:3]'},
             {'name': 'Amide Cleavage', 'smarts': '[C:1](=[O:2])-[N:3]-[#6:4]>>[C:1](=[O:2])O.[#6:4][N:3]'},
-            {'name': 'Ether Cleavage', 'smarts': '[#6:1]-[O:2]-[#6:3]>>[#6:1][OH:2].[#6:3]O'},
+            {'name': 'Ether Cleavage', 'smarts': '[#6;!$(C=O):1]-[O:2]-[#6;!$(C=O):3]>>[#6:1][OH:2].[#6:3]O'},
             {'name': 'Imine Cleavage', 'smarts': '[C:1]=[N:2]>>[C:1]=O.[N:2]'},
             {'name': 'Alkene Cleavage', 'smarts': '[C:1]=[C:2]>>[C:1]=O.[C:2]=O'},
             {'name': 'Nitro Reduction (Retro)', 'smarts': '[c:1][NH2]>>[c:1][N+](=O)[O-]'},
@@ -59,7 +59,7 @@ class ChemistryEngine:
         self.breakable_patterns = [
             Chem.MolFromSmarts('[C](=[O])-[O]-[#6]'),  # Ester
             Chem.MolFromSmarts('[C](=[O])-[N]-[#6]'),  # Amide
-            Chem.MolFromSmarts('[#6]-[O]-[#6]'),  # Ether
+            Chem.MolFromSmarts('[#6;!$(C=O)]-[O]-[#6;!$(C=O)]'),  # Ether
             Chem.MolFromSmarts('[C]=[N]'),  # Imine
             Chem.MolFromSmarts('[C]=[C]'),  # Alkene
             Chem.MolFromSmarts('[S](=[O])(=[O])-[N]'),  # Sulfonamide
